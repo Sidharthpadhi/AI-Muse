@@ -1,0 +1,411 @@
+import streamlit as st
+import pandas as pd
+import pypdf
+import easyocr # Ensure this and its dependencies (PyTorch, OpenCV) are correctly installed
+import re
+import time
+import os
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError # Rename to avoid conflict
+from io import BytesIO
+import traceback # For detailed error messages
+import logging # For more robust logging
+
+# --- Application Level Configuration ---
+# Setup basic logging to console. In a deployed app, you might configure this more elaborately.
+# Log messages will appear in the console where `streamlit run app.py` is executed.
+logging.basicConfig(
+    level=logging.INFO, # Set to logging.DEBUG for more verbose output
+    format='%(asctime)s - %(process)d - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Maximum number of worker processes. OCR can be memory-intensive.
+# Adjust based on server CPU and memory. Using fewer workers than CPU cores
+# can sometimes be more stable if memory is a constraint.
+MAX_WORKERS = max(1, (os.cpu_count() or 1) // 2 if (os.cpu_count() or 0) > 1 else 1)
+
+# --- OCR Reader Initialization ---
+# This function will be called inside each worker process
+def get_ocr_reader_instance():
+    """
+    Initializes and returns an EasyOCR Reader instance.
+    This function is intended to be called from within a worker process.
+    """
+    try:
+        logger.info(f"PID {os.getpid()}: Initializing EasyOCR Reader...")
+        # gpu=False for CPU processing. Set to True if a CUDA-enabled GPU is available and configured.
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False) # verbose=False to reduce console spam from EasyOCR
+        logger.info(f"PID {os.getpid()}: EasyOCR Reader initialized successfully.")
+        return reader
+    except Exception as e:
+        logger.error(f"PID {os.getpid()}: Failed to initialize EasyOCR Reader: {e}", exc_info=True)
+        raise RuntimeError(f"EasyOCR Reader initialization failed in worker: {str(e)}") from e
+
+# --- File Processing Functions (Run in Separate Processes) ---
+# These functions should be self-contained and handle their own errors, returning a dict.
+
+def process_image(file_bytes, filename="image"):
+    process_pid = os.getpid()
+    logger.info(f"PID {process_pid}: Starting image processing for {filename}")
+    try:
+        ocr_reader = get_ocr_reader_instance()
+        # detail=0 for just text, detail=1 for text, box, conf
+        result = ocr_reader.readtext(file_bytes, detail=0)
+        text = " ".join(result)
+        logger.info(f"PID {process_pid}: Finished image processing for {filename}")
+        return {"filename": filename, "type": "image", "text": text, "status": "processed", "error": None}
+    except Exception as e:
+        logger.error(f"PID {process_pid}: Error processing image {filename}: {e}", exc_info=True)
+        detailed_error_msg = f"Error during OCR for '{filename}':\n{type(e).__name__}: {str(e)}\nTraceback (see console logs for PID {process_pid} for full details)."
+        return {"filename": filename, "type": "image", "text": None, "status": "error", "error": detailed_error_msg}
+
+def process_pdf(file_bytes, filename="pdf"):
+    process_pid = os.getpid()
+    logger.info(f"PID {process_pid}: Starting PDF processing for {filename}")
+    try:
+        pdf_file = BytesIO(file_bytes)
+        reader = pypdf.PdfReader(pdf_file)
+        text_parts = []
+        for i, page in enumerate(reader.pages):
+            try:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+            except Exception as page_e:
+                logger.warning(f"PID {process_pid}: Could not extract text from page {i+1} of {filename}: {page_e}")
+                text_parts.append(f"[Page {i+1} text extraction failed: {str(page_e)}]")
+        text = "\n\n".join(text_parts) # Separate pages clearly
+        logger.info(f"PID {process_pid}: Finished PDF processing for {filename}")
+        return {"filename": filename, "type": "pdf", "text": text, "status": "processed", "error": None}
+    except Exception as e:
+        logger.error(f"PID {process_pid}: Error processing PDF {filename}: {e}", exc_info=True)
+        detailed_error_msg = f"Error during PDF processing for '{filename}':\n{type(e).__name__}: {str(e)}\nTraceback (see console logs for PID {process_pid} for full details)."
+        return {"filename": filename, "type": "pdf", "text": None, "status": "error", "error": detailed_error_msg}
+
+def process_csv(file_bytes, filename="csv"):
+    process_pid = os.getpid()
+    logger.info(f"PID {process_pid}: Starting CSV processing for {filename}")
+    encodings_to_try = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+    df = None
+    used_encoding = None
+    try:
+        for encoding in encodings_to_try:
+            try:
+                # Decode bytes to string first, then pass to BytesIO for pandas
+                decoded_content = file_bytes.decode(encoding)
+                df = pd.read_csv(BytesIO(decoded_content.encode(encoding))) # Pandas expects bytes for BytesIO
+                used_encoding = encoding
+                logger.info(f"PID {process_pid}: Successfully read CSV {filename} with encoding {used_encoding}")
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError) as decode_err:
+                logger.warning(f"PID {process_pid}: Failed to read CSV {filename} with encoding {encoding}: {decode_err}")
+                if encoding == encodings_to_try[-1]: # Last attempt
+                    raise ValueError(f"Could not decode/parse CSV '{filename}' with tried encodings: {', '.join(encodings_to_try)}") from decode_err
+        
+        if df is None:
+             raise ValueError(f"DataFrame could not be loaded from CSV '{filename}'.")
+
+        text_parts = [f"CSV Content (Encoding: {used_encoding}):"]
+        for col in df.columns:
+            text_parts.append(f"\nColumn: {col}\n" + df[col].astype(str).str.cat(sep='; ')) # Use semicolon or other delimiter
+        text = "\n".join(text_parts)
+        logger.info(f"PID {process_pid}: Finished CSV processing for {filename}")
+        return {"filename": filename, "type": "csv", "text": text, "status": "processed", "error": None}
+    except Exception as e:
+        logger.error(f"PID {process_pid}: Error processing CSV {filename}: {e}", exc_info=True)
+        detailed_error_msg = f"Error during CSV processing for '{filename}':\n{type(e).__name__}: {str(e)}\nTraceback (see console logs for PID {process_pid} for full details)."
+        return {"filename": filename, "type": "csv", "text": None, "status": "error", "error": detailed_error_msg}
+
+def process_txt(file_bytes, filename="txt"):
+    process_pid = os.getpid()
+    logger.info(f"PID {process_pid}: Starting TXT processing for {filename}")
+    encodings_to_try = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+    text = None
+    try:
+        for encoding in encodings_to_try:
+            try:
+                text = file_bytes.decode(encoding)
+                logger.info(f"PID {process_pid}: Successfully read TXT {filename} with encoding {encoding}")
+                break
+            except UnicodeDecodeError:
+                logger.warning(f"PID {process_pid}: Failed to read TXT {filename} with encoding {encoding}")
+                if encoding == encodings_to_try[-1]:
+                     raise ValueError(f"Could not decode TXT '{filename}' with tried encodings: {', '.join(encodings_to_try)}")
+        if text is None:
+            raise ValueError(f"Could not decode text file '{filename}'.")
+        logger.info(f"PID {process_pid}: Finished TXT processing for {filename}")
+        return {"filename": filename, "type": "txt", "text": text, "status": "processed", "error": None}
+    except Exception as e:
+        logger.error(f"PID {process_pid}: Error processing TXT {filename}: {e}", exc_info=True)
+        detailed_error_msg = f"Error during TXT processing for '{filename}':\n{type(e).__name__}: {str(e)}\nTraceback (see console logs for PID {process_pid} for full details)."
+        return {"filename": filename, "type": "txt", "text": None, "status": "error", "error": detailed_error_msg}
+
+# --- Text Analysis Function ---
+def extract_and_classify(text_content, filename=""): # Added filename for logging
+    if not text_content or not isinstance(text_content, str):
+        logger.warning(f"extract_and_classify for {filename} called with empty or invalid text_content.")
+        return {"extracted_info": {}, "classification": "No text to process"}
+
+    logger.info(f"Starting text analysis for {filename} (text length: {len(text_content)})")
+    extracted_info = {}
+    try:
+        emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text_content)
+        if emails: extracted_info['emails'] = list(set(emails))
+
+        phones = re.findall(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', text_content)
+        if phones: extracted_info['phones'] = list(set(phones))
+        
+        dates = re.findall(r'\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*-\d{2,4})\b', text_content, re.IGNORECASE)
+        if dates: extracted_info['dates'] = list(set(dates))
+
+    except Exception as regex_e:
+        logger.error(f"Regex extraction error for {filename}: {regex_e}", exc_info=True)
+        extracted_info['regex_error'] = f"A regex operation failed: {str(regex_e)}"
+
+    classification = "General Document"
+    lower_text_content = text_content.lower() # Perform .lower() once
+    if any(kw in lower_text_content for kw in ["invoice", "receipt", "bill"]):
+        classification = "Financial Document"
+    elif any(kw in lower_text_content for kw in ["resume", "cv", "curriculum vitae"]):
+        classification = "Resume/CV"
+    elif extracted_info.get('emails') or extracted_info.get('phones'):
+        classification = "Contact Info Detected"
+    elif any(kw in lower_text_content for kw in ["agreement", "contract", "nda"]):
+        classification = "Legal Document"
+    
+    logger.info(f"Text analysis for {filename} complete. Classification: {classification}. Extracted keys: {list(extracted_info.keys())}")
+    return {"extracted_info": extracted_info, "classification": classification}
+
+# --- Streamlit UI & Main Application Logic ---
+
+def initialize_session_state():
+    if 'processing_status' not in st.session_state:
+        st.session_state.processing_status = {}
+    if 'executor' not in st.session_state:
+        logger.info(f"Main PID {os.getpid()}: Creating ProcessPoolExecutor with max_workers={MAX_WORKERS}")
+        try:
+            st.session_state.executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
+        except Exception as e: # Catch errors during executor creation (e.g. resource issues)
+            logger.critical(f"Main PID {os.getpid()}: Failed to create ProcessPoolExecutor: {e}", exc_info=True)
+            st.error(f"Critical Error: Could not initialize background processing engine. Please check logs. Error: {e}")
+            st.stop() # Halt the app if executor can't be created.
+            
+    if 'uploaded_file_ids_ordered' not in st.session_state:
+        st.session_state.uploaded_file_ids_ordered = []
+
+def get_file_key(uploaded_file_obj):
+    if hasattr(uploaded_file_obj, 'file_id') and uploaded_file_obj.file_id is not None:
+        return uploaded_file_obj.file_id # Preferred: Unique per upload instance
+    else: # Fallback for older Streamlit or if file_id is missing
+        return f"{uploaded_file_obj.name}_{uploaded_file_obj.size}_{uploaded_file_obj.type}"
+
+
+def file_scanner_page():
+    st.header("📄 Advanced File Scanner & Analyzer")
+    initialize_session_state() # Ensures executor is ready
+
+    if 'executor' not in st.session_state or st.session_state.executor is None:
+        st.error("Background processing engine is not available. The application cannot proceed.")
+        return # Stop rendering this page if executor failed to initialize
+
+    uploaded_files = st.file_uploader(
+        "Upload files (Images, PDFs, CSVs, TXTs)",
+        accept_multiple_files=True,
+        type=['png', 'jpg', 'jpeg', 'pdf', 'csv', 'txt'],
+        key="file_uploader_widget"
+    )
+
+    if st.button("Clear All Files & Reset", key="clear_all_btn", help="Clears displayed files and attempts to cancel ongoing tasks."):
+        logger.info(f"Main PID {os.getpid()}: 'Clear All' button pressed.")
+        # Attempt to cancel ongoing futures. Success depends on whether the task has started.
+        for file_id, task_info in list(st.session_state.processing_status.items()): # Iterate over a copy
+            if task_info.get("future") and not task_info["future"].done():
+                cancelled = task_info["future"].cancel()
+                logger.info(f"Main PID {os.getpid()}: Attempted to cancel task for {task_info.get('filename', file_id)}: {cancelled}")
+        
+        st.session_state.processing_status = {}
+        st.session_state.uploaded_file_ids_ordered = []
+        if "file_uploader_widget" in st.session_state: # Reset file uploader
+            st.session_state.file_uploader_widget = []
+        st.toast("All files and statuses cleared.", icon="🗑️")
+        st.rerun()
+
+    if uploaded_files:
+        new_files_submitted_count = 0
+        for uploaded_file_obj in uploaded_files:
+            file_key = get_file_key(uploaded_file_obj)
+            
+            if file_key not in st.session_state.processing_status: # Only process new files
+                try:
+                    file_bytes = uploaded_file_obj.getvalue() # Read file bytes
+                    filename = uploaded_file_obj.name
+                    file_type = uploaded_file_obj.type
+                    future = None
+                    
+                    logger.info(f"Main PID {os.getpid()}: Submitting file '{filename}' ({file_type}, key: {file_key}) for processing.")
+
+                    # Ensure executor is available before submitting
+                    if 'executor' not in st.session_state or st.session_state.executor is None:
+                         st.error("Background processor not available. Cannot submit tasks.")
+                         logger.error(f"Main PID {os.getpid()}: Executor not found in session_state when trying to submit {filename}")
+                         break # Stop processing further uploads in this batch if executor is gone
+
+                    if file_type in ["image/png", "image/jpeg", "image/jpg"]:
+                        future = st.session_state.executor.submit(process_image, file_bytes, filename)
+                    elif file_type == "application/pdf":
+                        future = st.session_state.executor.submit(process_pdf, file_bytes, filename)
+                    elif file_type in ["text/csv", "application/vnd.ms-excel"] or filename.lower().endswith(".csv"): # More robust CSV type check
+                        future = st.session_state.executor.submit(process_csv, file_bytes, filename)
+                    elif file_type == "text/plain" or filename.lower().endswith(".txt"):
+                        future = st.session_state.executor.submit(process_txt, file_bytes, filename)
+                    else:
+                        unsupported_msg = f"Unsupported file type: {file_type} for file '{filename}'"
+                        logger.warning(f"Main PID {os.getpid()}: {unsupported_msg}")
+                        st.session_state.processing_status[file_key] = {
+                            "filename": filename, "status": "error", 
+                            "result": {"error": unsupported_msg}, "future": None
+                        }
+                        if file_key not in st.session_state.uploaded_file_ids_ordered:
+                             st.session_state.uploaded_file_ids_ordered.append(file_key)
+                        continue # Skip to next file
+
+                    st.session_state.processing_status[file_key] = {
+                        "filename": filename, "status": "processing", 
+                        "result": None, "future": future
+                    }
+                    if file_key not in st.session_state.uploaded_file_ids_ordered:
+                        st.session_state.uploaded_file_ids_ordered.append(file_key)
+                    new_files_submitted_count += 1
+                except Exception as upload_err:
+                    logger.error(f"Main PID {os.getpid()}: Error handling uploaded file '{uploaded_file_obj.name}': {upload_err}", exc_info=True)
+                    st.error(f"Could not prepare '{uploaded_file_obj.name}' for processing: {upload_err}")
+                    st.session_state.processing_status[file_key] = {
+                        "filename": uploaded_file_obj.name, "status": "error",
+                        "result": {"error": f"Error during upload/submission: {str(upload_err)}"}, "future": None
+                    }
+                    if file_key not in st.session_state.uploaded_file_ids_ordered:
+                        st.session_state.uploaded_file_ids_ordered.append(file_key)
+        
+        if new_files_submitted_count > 0:
+            st.toast(f"{new_files_submitted_count} new file(s) added to processing queue.", icon="⏳")
+
+    if st.session_state.processing_status:
+        st.subheader("📊 Processing Status & Results")
+        active_processing_exists = False
+        ordered_keys_to_check = st.session_state.uploaded_file_ids_ordered[:] 
+
+        for file_key in ordered_keys_to_check:
+            if file_key not in st.session_state.processing_status: continue
+            task_info = st.session_state.processing_status[file_key]
+            
+            if task_info["status"] == "processing" and task_info.get("future"):
+                active_processing_exists = True
+                current_future = task_info["future"]
+                try:
+                    result = current_future.result(timeout=0.05) # Non-blocking check
+                    logger.info(f"Main PID {os.getpid()}: Task for '{task_info['filename']}' (key: {file_key}) completed.")
+                    
+                    if result.get("status") == "processed" and result.get("text"):
+                        analysis_start_time = time.time()
+                        analysis = extract_and_classify(result["text"], task_info['filename'])
+                        result.update(analysis)
+                        logger.info(f"Main PID {os.getpid()}: Text analysis for '{task_info['filename']}' took {time.time() - analysis_start_time:.2f}s")
+                    
+                    st.session_state.processing_status[file_key].update({
+                        "status": result.get("status", "completed_with_issue"),
+                        "result": result, "future": None
+                    })
+                    st.toast(f"'{task_info['filename']}' processed!", icon="✅")
+                    st.rerun()
+                
+                except FutureTimeoutError: pass # Task not done, normal
+                except Exception as e: # Error from future.result() or subsequent analysis
+                    logger.error(f"Main PID {os.getpid()}: Error retrieving/analyzing result for '{task_info['filename']}' (key: {file_key}): {e}", exc_info=True)
+                    error_msg_detail = (f"Critical error processing result for '{task_info['filename']}':\n"
+                                        f"{type(e).__name__}: {str(e)}\n"
+                                        f"Traceback (see console logs for PID {os.getpid()} for full details).")
+                    st.session_state.processing_status[file_key].update({
+                        "status": "error", 
+                        "result": {"error": error_msg_detail}, "future": None
+                    })
+                    st.error(f"Failed to finalize processing for '{task_info['filename']}'.")
+                    st.rerun()
+
+            # UI Display for each file
+            display_filename = task_info.get('filename', 'N/A')
+            short_file_key_id = f"...{file_key[-8:]}" if len(file_key) > 8 else file_key
+            expander_title = f"File: {display_filename} (ID: {short_file_key_id})"
+            
+            with st.expander(expander_title, expanded=task_info['status'] == 'processing' or task_info['status'] == 'error'):
+                status = task_info['status']
+                result_data = task_info.get("result", {})
+
+                st.caption(f"Status: **{status.upper()}**")
+                if status == "processing":
+                    st.spinner(f"Processing {display_filename}...")
+                elif status == "error":
+                    st.error("An error occurred:")
+                    error_details = result_data.get("error", "Unknown error")
+                    st.text_area("Error Details:", value=str(error_details), height=150, disabled=True, key=f"err_txt_{file_key}")
+                elif status in ["processed", "completed_with_issue"]:
+                    st.success("Processing successful!")
+                    st.write(f"**Detected File Type:** {result_data.get('type', 'N/A')}")
+                    st.write(f"**Classification:** {result_data.get('classification', 'N/A')}")
+                    
+                    st.subheader("Extracted Information:")
+                    extracted = result_data.get('extracted_info', {})
+                    st.json(extracted if extracted else {"message": "No specific information extracted."})
+
+                    st.subheader("Raw Extracted Text (Snippet):")
+                    raw_text = result_data.get('text', '')
+                    st.text_area("Text Snippet:", value=(raw_text[:2000] + "..." if len(raw_text) > 2000 else raw_text) if raw_text else "No text extracted.", 
+                                 height=200, key=f"text_snippet_{file_key}", disabled=True)
+        
+        if active_processing_exists:
+            time.sleep(2) # Polling interval
+            logger.debug(f"Main PID {os.getpid()}: Active processing detected, scheduling a rerun for UI update.")
+            st.rerun()
+    else:
+        st.info("✨ Upload files to begin automated extraction and classification.")
+
+def db_scanner_page():
+    st.header("🗄️ Database Scanner (Placeholder)")
+    st.image("https://streamlit.io/images/brand/streamlit-logo-secondary-colormark-darktext.svg", width=200) # Placeholder image
+    st.write("This page is intended for future database scanning functionalities.")
+    st.write("File processing tasks from the 'File Processor' page continue in the background.")
+    
+    if 'processing_status' in st.session_state and st.session_state.processing_status:
+        # Summary similar to previous versions
+        total = len(st.session_state.processing_status)
+        processing = sum(1 for info in st.session_state.processing_status.values() if info['status'] == 'processing')
+        succeeded = sum(1 for info in st.session_state.processing_status.values() if info['status'] == 'processed')
+        failed = sum(1 for info in st.session_state.processing_status.values() if info['status'] == 'error')
+        st.metric("Total Files Handled This Session", total)
+        cols = st.columns(3)
+        cols[0].metric("Actively Processing", processing)
+        cols[1].metric("Successfully Processed", succeeded)
+        cols[2].metric("Failed", failed)
+
+# --- Main App Structure ---
+def main():
+    st.set_page_config(layout="wide", page_title="DocuMind - Intelligent File Processor")
+    
+    st.sidebar.title("📄➡️🧠 DocuMind")
+    st.sidebar.markdown("Automated Document Analysis & Classification")
+    
+    page_options = { "File Processor": file_scanner_page, "Database Scanner": db_scanner_page }
+    page_selection = st.sidebar.radio("Navigation", list(page_options.keys()),
+                                      format_func=lambda x: f"{'📄' if x == 'File Processor' else '🗄️'} {x}")
+    
+    page_options[page_selection]() # Execute selected page function
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Workers: {MAX_WORKERS} | Streamlit v{st.__version__} | PID: {os.getpid()}")
+
+if __name__ == "__main__":
+    # Note: ProcessPoolExecutor might behave better if main module is importable.
+    # Streamlit handles this by running the script as a module.
+    # For ProcessPoolExecutor, it's crucial that worker functions (like process_image)
+    # and any functions they call (like get_ocr_reader_instance) are defined at the
+    # top level of the module or are importable.
+    main()
